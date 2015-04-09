@@ -101,24 +101,27 @@ FASTCALL_ATTR JSOBJ FASTCALL_MSVC decodePreciseFloat(struct DecoderState *ds)
 
 FASTCALL_ATTR JSOBJ FASTCALL_MSVC decode_numeric (struct DecoderState *ds)
 {
+  int isBigNumber = 0;
   int intNeg = 1;
   int mantSize = 0;
   JSUINT64 intValue;
-  JSUINT64 prevIntValue;
   int chr;
   int decimalCount = 0;
   double frcValue = 0.0;
   double expNeg;
   double expValue;
   char *offset = ds->start;
-
-  JSUINT64 overflowLimit = LLONG_MAX;
+  char *start = ds->start;
+  
+ // x <= overflowLimit --> x * 10 + 9 <= ULLONG_MAX
+ JSUINT64 overflowLimit = (ULLONG_MAX - 9) / 10;
 
   if (*(offset) == '-')
   {
     offset ++;
     intNeg = -1;
-    overflowLimit = LLONG_MIN;
+    // x <= overflowLimit --> x * 10 + 9 <= -LLONG_MIN
+    overflowLimit = (-1ULL * LLONG_MIN - 9) / 10;
   }
 
   // Scan integer part
@@ -141,17 +144,16 @@ FASTCALL_ATTR JSOBJ FASTCALL_MSVC decode_numeric (struct DecoderState *ds)
       case '8':
       case '9':
       {
-        //PERF: Don't do 64-bit arithmetic here unless we know we have to
-        prevIntValue = intValue;
-        intValue = intValue * 10ULL + (JSLONG) (chr - 48);
-
-        if (intNeg == 1 && prevIntValue > intValue)
+        if (!isBigNumber)
         {
-          return SetError(ds, -1, "Value is too big!");
-        }
-        else if (intNeg == -1 && intValue > overflowLimit)
-        {
-          return SetError(ds, -1, overflowLimit == LLONG_MAX ? "Value is too big!" : "Value is too small");
+          if (intValue <= overflowLimit)
+          {
+            intValue = intValue * 10ULL + (JSLONG) (chr - 48);
+          }
+          else
+          {
+            isBigNumber = 1;
+          }
         }
 
         offset ++;
@@ -185,7 +187,22 @@ BREAK_INT_LOOP:
   ds->lastType = JT_INT;
   ds->start = offset;
 
-  if (intNeg == 1 && (intValue & 0x8000000000000000ULL) != 0)
+  if (isBigNumber)
+  {
+    JSOBJ bigLong;
+    char *buffer = (char *) ds->dec->malloc((mantSize + 1) * sizeof(char));
+    if (!buffer) {
+      return SetError(ds, -1, "Could not reserve memory block");
+    }
+
+    memcpy(buffer, start, mantSize);
+    buffer[mantSize] = '\0';
+    
+    bigLong = ds->dec->newBigLong(ds->prv, buffer);
+    ds->dec->free(buffer);
+    return bigLong;
+  }
+  else if (intNeg == 1 && (intValue & 0x8000000000000000ULL) != 0)
   {
     return ds->dec->newUnsignedLong(ds->prv, intValue);
   }
@@ -200,7 +217,7 @@ BREAK_INT_LOOP:
 
 DECODE_FRACTION:
 
-  if (ds->dec->preciseFloat)
+  if (ds->dec->preciseFloat || isBigNumber)
   {
     return decodePreciseFloat(ds);
   }
@@ -253,7 +270,8 @@ BREAK_FRC_LOOP:
   return ds->dec->newDouble (ds->prv, createDouble( (double) intNeg, (double) intValue, frcValue, decimalCount));
 
 DECODE_EXPONENT:
-  if (ds->dec->preciseFloat)
+  
+  if (ds->dec->preciseFloat || isBigNumber)
   {
     return decodePreciseFloat(ds);
   }
